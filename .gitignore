@@ -1,0 +1,62 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Vim
+*.swp
+
+# Compiled Dynamic libraries
+*.so
+*.so.*
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# cMake files
+CMakeCache.txt
+CMakeFiles
+Makefile
+cmake_install.cmake
+install_manifest.txt
+
+# compiled exe
+emf2svg-conv
+
+# out directory
+out
+build
+
+# test files
+tests/resources/tmp
+
+# VS files
+.vs
+
+
+# external build directory
+external-build
+
+coverage
+emf2svg-test
+
+# exceptions
+!tests/resources/filesmasher-master/Makefile
+
+# external projects
+vcpkg
+vcpkg_installed
+vcpkg-manifest-install.log
+vcpkg-bootstrap.log
+coverage.*

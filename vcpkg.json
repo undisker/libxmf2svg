@@ -1,0 +1,12 @@
+{
+  "name": "libemf2svg-patched",
+  "version-string": "1.8.2",
+  "description": "Patched EMF to SVG conversion library with fixes for EMF+ image rendering",
+  "dependencies": [
+    "libxml2",
+    "libpng",
+    "libiconv",
+    "freetype",
+    "fontconfig"
+  ]
+}
