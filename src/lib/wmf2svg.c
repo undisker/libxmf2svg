@@ -8,6 +8,7 @@
 #include "wmf2svg.h"
 #include "wmf2svg_private.h"
 #include "uwmf.h"
+#include "emf2svg_img_utils.h" /* shared DIB->PNG helpers (rgb2png, RLE, params) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -462,6 +463,122 @@ void wmf_fill_style(WMF_DRAWING_STATES *states, FILE *out) {
 /* =========================================================================
  * Record Processing
  * ========================================================================= */
+
+/**
+ * @brief Draw a packed DIB (BITMAPINFO + color table + bits) as an SVG
+ * <image> element at the destination rect. Reuses the emf2svg image
+ * helpers (RLE decompression, DIB parameter parsing, PNG encoding).
+ * Malformed/oversized DIBs are skipped silently - the record then simply
+ * draws nothing, like any other unsupported record.
+ */
+static void wmf_dib_image(FILE *out, WMF_DRAWING_STATES *states,
+                          const char *record, uint32_t recSize,
+                          const char *dib, U_POINT16 Dst, U_POINT16 cDst) {
+    PU_BITMAPINFO Bmi = (PU_BITMAPINFO)dib;
+    PU_BITMAPINFOHEADER BmiSrc = &(Bmi->bmiHeader);
+    const U_RGBQUAD *ct = NULL;
+    uint32_t numCt = 0, width = 0, height = 0, colortype = 0, invert = 0;
+    char *rgba_px = NULL;
+    char *b64Bmp = NULL, *tmp = NULL;
+    size_t b64s = 0;
+    const char *recEnd = record + recSize;
+    const unsigned char *px;
+    size_t pxSize, need;
+    const char *in;
+    size_t img_size;
+    double x, y, w, h;
+    RGBBitmap convert_in, convert_out;
+    RGBABitmap convert_inpng;
+
+    if (dib + sizeof(U_BITMAPINFOHEADER) > recEnd) return;
+
+    x = wmf_scaleX(states, Dst.x);
+    y = wmf_scaleY(states, Dst.y);
+    w = wmf_scaleX(states, Dst.x + cDst.x) - x;
+    h = wmf_scaleY(states, Dst.y + cDst.y) - y;
+    if (w <= 0.0 || h <= 0.0) return;
+
+    /* JPEG/PNG passthrough blobs embed verbatim */
+    if (BmiSrc->biCompression == U_BI_JPEG ||
+        BmiSrc->biCompression == U_BI_PNG) {
+        px = (const unsigned char *)dib + BmiSrc->biSize;
+        if ((const char *)px >= recEnd) return;
+        b64Bmp = wmf_base64_encode(px, (size_t)(recEnd - (const char *)px),
+                                   &b64s);
+        if (!b64Bmp) return;
+        fprintf(out,
+                "<%simage x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" "
+                "preserveAspectRatio=\"none\" "
+                "xlink:href=\"data:image/%s;base64,%s\"/>\n",
+                states->nameSpaceString, x, y, w, h,
+                BmiSrc->biCompression == U_BI_JPEG ? "jpg" : "png", b64Bmp);
+        free(b64Bmp);
+        return;
+    }
+
+    if (e2s_get_DIB_params(Bmi, &ct, &numCt, &width, &height, &colortype,
+                           &invert) ||
+        width == 0 || height == 0 || width > 10000 || height > 10000)
+        return;
+
+    px = (const unsigned char *)dib + BmiSrc->biSize +
+         (size_t)numCt * sizeof(U_RGBQUAD);
+    if ((const char *)px >= recEnd) return;
+    pxSize = (size_t)(recEnd - (const char *)px);
+
+    convert_in.size = pxSize;
+    convert_in.width = BmiSrc->biWidth;
+    convert_in.height = BmiSrc->biHeight;
+    convert_in.pixels = (RGBPixel *)px;
+    convert_in.bytewidth = BmiSrc->biWidth * 3;
+    convert_in.bytes_per_pixel = 3;
+    convert_out.pixels = NULL;
+
+    switch (BmiSrc->biCompression) {
+    case U_BI_RLE8: convert_out = rle8ToRGB8(convert_in); break;
+    case U_BI_RLE4: convert_out = rle4ToRGB(convert_in); break;
+    }
+
+    if (convert_out.pixels != NULL) {
+        in = (const char *)convert_out.pixels;
+        img_size = convert_out.size;
+    } else {
+        in = (const char *)px;
+        img_size = pxSize;
+    }
+
+    need = (size_t)((float)width * (float)height * get_pixel_size(colortype));
+    if (img_size < need) {
+        free(convert_out.pixels);
+        return;
+    }
+
+    DIB_to_RGBA(in, ct, numCt, &rgba_px, width, height, colortype, numCt,
+                invert);
+    free(convert_out.pixels);
+    if (rgba_px == NULL) return;
+
+    convert_inpng.size = (size_t)width * 4 * height;
+    convert_inpng.width = width;
+    convert_inpng.height = height;
+    convert_inpng.pixels = (RGBAPixel *)rgba_px;
+    convert_inpng.bytewidth = width * 4;
+    convert_inpng.bytes_per_pixel = 4;
+
+    rgb2png(&convert_inpng, &tmp, &b64s);
+    free(rgba_px);
+    if (tmp == NULL) return;
+    b64Bmp = wmf_base64_encode((unsigned char *)tmp, b64s, &b64s);
+    free(tmp);
+    if (b64Bmp == NULL) return;
+
+    fprintf(out,
+            "<%simage x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" "
+            "preserveAspectRatio=\"none\" "
+            "xlink:href=\"data:image/png;base64,%s\"/>\n",
+            states->nameSpaceString, x, y, w, h, b64Bmp);
+    free(b64Bmp);
+}
 
 /**
  * @brief Process a single WMF record
@@ -1140,6 +1257,46 @@ int wmf_onerec_draw(const char *contents, const char *blimit, int recnum,
         }
 
         /* Ignored records */
+        case U_WMR_DIBBITBLT: {
+            U_POINT16 Dst, cwh, Src;
+            uint32_t dwRop3;
+            const char *dib = NULL;
+            if (U_WMRDIBBITBLT_get(contents, &Dst, &cwh, &Src, &dwRop3,
+                                   &dib) > 0 && dib != NULL) {
+                wmf_dib_image(out, states, contents, size, dib, Dst, cwh);
+                wmf_verbose_printf("   Type: DIBBITBLT\n");
+                WMF_FLAG_SUPPORTED;
+            }
+            break;
+        }
+
+        case U_WMR_DIBSTRETCHBLT: {
+            U_POINT16 Dst, cDst, Src, cSrc;
+            uint32_t dwRop3;
+            const char *dib = NULL;
+            if (U_WMRDIBSTRETCHBLT_get(contents, &Dst, &cDst, &Src, &cSrc,
+                                       &dwRop3, &dib) > 0 && dib != NULL) {
+                wmf_dib_image(out, states, contents, size, dib, Dst, cDst);
+                wmf_verbose_printf("   Type: DIBSTRETCHBLT\n");
+                WMF_FLAG_SUPPORTED;
+            }
+            break;
+        }
+
+        case U_WMR_STRETCHDIB: {
+            U_POINT16 Dst, cDst, Src, cSrc;
+            uint16_t cUsage;
+            uint32_t dwRop3;
+            const char *dib = NULL;
+            if (U_WMRSTRETCHDIB_get(contents, &Dst, &cDst, &Src, &cSrc,
+                                    &cUsage, &dwRop3, &dib) > 0 && dib != NULL) {
+                wmf_dib_image(out, states, contents, size, dib, Dst, cDst);
+                wmf_verbose_printf("   Type: STRETCHDIB\n");
+                WMF_FLAG_SUPPORTED;
+            }
+            break;
+        }
+
         case U_WMR_SETRELABS:
         case U_WMR_SETSTRETCHBLTMODE:
         case U_WMR_SETMAPPERFLAGS:
@@ -1342,7 +1499,8 @@ int wmf2svg(char *contents, size_t length, char **out, size_t *out_length,
     /* Write SVG header */
     if (states.svgDelimiter) {
         fprintf(stream, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        fprintf(stream, "<%ssvg xmlns%s%s=\"http://www.w3.org/2000/svg\" ",
+        fprintf(stream, "<%ssvg xmlns%s%s=\"http://www.w3.org/2000/svg\" "
+                        "xmlns:xlink=\"http://www.w3.org/1999/xlink\" ",
                 states.nameSpaceString,
                 strlen(states.nameSpace) > 0 ? ":" : "",
                 states.nameSpace);

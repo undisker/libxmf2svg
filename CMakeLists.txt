@@ -211,6 +211,7 @@ endif()
 add_library(wmf2svg
   ${SHARED}
   src/lib/wmf2svg.c
+  src/lib/emf2svg_img_utils.c
   ${UWMF_SOURCES}
 )
 
@@ -224,6 +225,7 @@ set_target_properties(wmf2svg
 )
 
 target_link_libraries(wmf2svg
+  ${PNG_LIBRARIES}
   ${LIBXML2_LIBRARIES}
   ${EXTERNAL_ICONV}
   ${EXTERNAL_FMEM}
